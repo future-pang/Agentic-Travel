@@ -36,6 +36,7 @@ from server.agent.state import AgentState
 from core.skill_loader import skill_loader
 from server.agent.llm_factory import get_planner_llm
 from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
 
 from core.tool_registry import physical_tool_manager
 from server.tools.task_stop_tool import task_stop_tool
@@ -45,13 +46,17 @@ from utils.logger import get_logger
 
 logger = get_logger("shiliu.agent.coordinator")
 
+# ── 模块级缓存：system prompt + tools 只构建一次，保证 DeepSeek prefix cache 命中 ──
+_CACHED_SYSTEM_MESSAGE = None
+_CACHED_LLM_WITH_TOOLS = None
 
-async def coordinator_node(state: AgentState) -> dict:
-    node_logger = logger.bind(node="coordinator")
 
-    messages = state.get("messages", [])
+def _get_system_message() -> SystemMessage:
+    global _CACHED_SYSTEM_MESSAGE
+    if _CACHED_SYSTEM_MESSAGE is not None:
+        return _CACHED_SYSTEM_MESSAGE
+
     skill_listing = skill_loader.get_planner_listing()
-
     system_prompt = f"""你是协调员（coordinator），一个负责跨多个工作节点（Workers）编排任务的 AI 助手。
 
 ## 1. 你的作用
@@ -190,11 +195,32 @@ You:
   距离还在计算中。
   [Tool Call]: send_message(to_agent_id="weather_expert-a1b2c3d4", message="既然明天是大雨且气温 15 度，请根据这个天气，查一下周边有哪些适合避雨的室内文化场馆。")
 """
-    coord_tools = physical_tool_manager.get_coordinator_tools([spawn_worker, send_message, task_stop_tool])
-    llm = get_planner_llm().bind_tools(coord_tools)
+    _CACHED_SYSTEM_MESSAGE = SystemMessage(content=system_prompt)
+    logger.info("System Prompt 已缓存", chars=len(system_prompt))
+    return _CACHED_SYSTEM_MESSAGE
+
+
+def _get_llm_with_tools() -> BaseChatModel:
+    global _CACHED_LLM_WITH_TOOLS
+    if _CACHED_LLM_WITH_TOOLS is not None:
+        return _CACHED_LLM_WITH_TOOLS
+
+    coord_tools = physical_tool_manager.get_coordinator_tools(
+        [spawn_worker, send_message, task_stop_tool]
+    )
+    _CACHED_LLM_WITH_TOOLS = get_planner_llm().bind_tools(coord_tools)
+    logger.info("LLM + Tools 已缓存", tool_count=len(coord_tools))
+    return _CACHED_LLM_WITH_TOOLS
+
+
+async def coordinator_node(state: AgentState) -> dict:
+    node_logger = logger.bind(node="coordinator")
+
+    system_msg = _get_system_message()
+    llm = _get_llm_with_tools()
+    messages = [system_msg] + state.get("messages", [])
 
     node_logger.info("Coordinator 思考中...")
 
-    system_msg = SystemMessage(content=system_prompt)
-    response = await llm.ainvoke([system_msg] + messages)
+    response = await llm.ainvoke(messages)
     return {"messages": [response]}
