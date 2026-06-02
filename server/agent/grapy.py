@@ -69,4 +69,4 @@ async def build_agent():
     conn = await aiosqlite.connect(db_path)
     checkpointer = AsyncSqliteSaver(conn)
 
-    return workflow.compile(checkpointer=checkpointer)
+    return workflow.compile(checkpointer=checkpointer), conn

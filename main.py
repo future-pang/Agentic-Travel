@@ -272,12 +272,29 @@ async def _async_input(prompt: str) -> str:
 
 async def main():
     from server.agent.grapy import build_agent
+    from server.agent.session_storage import (
+        get_active_session_id,
+        create_new_session,
+        switch_to_new_session,
+        save_session_on_exit,
+        load_session,
+        list_sessions,
+        global_session_storage,
+    )
 
     if not check_config():
         sys.exit(1)
 
-    app = await build_agent()
-    session_id = f"session_{int(time.time())}"
+    app, _db_conn = await build_agent()
+
+    # 会话持久化：尝试恢复上次活跃会话，若无则创建新会话
+    resumed_id = get_active_session_id()
+    if resumed_id:
+        session_id = resumed_id
+        print(f"\n[系统] 已恢复上次会话: {session_id}")
+    else:
+        session_id = create_new_session()
+        print(f"\n[系统] 已创建新会话: {session_id}")
 
     # 追踪后台记忆提取任务，防止被 GC 丢弃或在 finally 前未完成
     _memory_tasks: set = set()
@@ -287,13 +304,12 @@ async def main():
 
     print()
     print("=" * 60)
-    print(" 交互模式 — 直接输入问题 | /clear 清空上下文 | /exit 退出")
+    print(" 交互模式 — 直接输入问题 | /sessions 历史会话 | /load <id> 加载会话 | /new 新建 | /clear 清空 | /exit 退出")
     print("=" * 60)
 
     try:
         while True:
             try:
-                # ⚡ 使用异步 input，让事件循环在等待用户输入期间可以继续执行后台任务（如记忆提取）
                 query = await _async_input("\n你: ")
                 query = query.strip()
             except (EOFError, KeyboardInterrupt):
@@ -303,12 +319,59 @@ async def main():
             if not query:
                 continue
             if query == "/exit":
+                print("[系统] 正在保存会话...")
+                save_session_on_exit()
                 print("[系统] 退出")
                 break
-            if query == "/clear":
-                session_id = f"interactive_{int(time.time())}"
+            if query == "/new":
                 _cleanup_workers()
+                await global_session_storage.flush()
+                new_id = switch_to_new_session()
+                # 清除内存中的已写入 UUID 记录，否则新会话不会写入
+                global_session_storage._written_uuids.clear()
+                print(f"[系统] 已创建新会话: {new_id}")
+                session_id = new_id
+                _memory_state["context"] = None
+                continue
+            if query == "/clear":
+                _cleanup_workers()
+                await global_session_storage.flush()
+                new_id = switch_to_new_session()
+                global_session_storage._written_uuids.clear()
                 print("[系统] 上下文已清空")
+                session_id = new_id
+                _memory_state["context"] = None
+                continue
+            if query == "/sessions":
+                sessions = list_sessions()
+                if not sessions:
+                    print("[系统] 暂无历史会话")
+                else:
+                    print("\n  历史会话列表:")
+                    print(f"  {'会话ID':<30} {'消息数':<8} {'最后活跃':<20} {'状态'}")
+                    print("  " + "-" * 75)
+                    from datetime import datetime
+                    for s in sessions:
+                        ts = datetime.fromtimestamp(s["last_active"]).strftime("%m-%d %H:%M:%S")
+                        marker = "← 当前" if s["is_active"] else ""
+                        print(f"  {s['session_id']:<30} {s['message_count']:<8} {ts:<20} {marker}")
+                    print()
+                continue
+            if query.startswith("/load"):
+                parts = query.split(maxsplit=1)
+                if len(parts) < 2:
+                    print("[系统] 用法: /load <session_id>")
+                    continue
+                target_id = parts[1].strip()
+                _cleanup_workers()
+                await global_session_storage.flush()
+                global_session_storage._written_uuids.clear()
+                if load_session(target_id):
+                    session_id = target_id
+                    _memory_state["context"] = None
+                    print(f"[系统] 已切换到会话: {session_id}")
+                else:
+                    print(f"[系统] 会话 {target_id} 的 JSONL 文件不存在，无法加载")
                 continue
 
             # 获取本轮对话前的消息长度，以便后台记忆提取器精确捕获增量对话消息
@@ -345,7 +408,16 @@ async def main():
             from server.memory.extractor import extract_travel_memories
             task = asyncio.create_task(extract_travel_memories(app, session_id, last_processed_len))
             _memory_tasks.add(task)
-            task.add_done_callback(_memory_tasks.discard)  # 完成后自动从集合移除，防止内存泄漏
+            task.add_done_callback(_memory_tasks.discard)
+
+            # 追加增量会话日志到 JSONL 文件中
+            try:
+                final_state = await app.aget_state(config)
+                from server.agent.session_storage import record_transcript
+                await record_transcript(session_id, final_state.values.get("messages", []))
+            except Exception as e:
+                print(f"[系统] 写入会话日志失败: {e}")
+
 
     finally:
         _cleanup_workers()
@@ -353,6 +425,12 @@ async def main():
         if _memory_tasks:
             print(f"[系统] 等待 {len(_memory_tasks)} 个记忆提取任务完成...")
             await asyncio.gather(*_memory_tasks, return_exceptions=True)
+
+        print("[系统] 正在将会话日志刷入磁盘...")
+        await global_session_storage.flush()
+        save_session_on_exit()
+        await _db_conn.close()
+        print("[系统] 数据库连接已关闭")
 
 
 if __name__ == "__main__":
