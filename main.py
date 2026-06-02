@@ -92,15 +92,14 @@ TOOL_LABELS = {
 }
 
 
-async def _stream_coordinator(app, messages, session_id: str) -> bool:
+async def _stream_coordinator(app, messages, session_id: str, memory_context=None) -> bool:
     """将消息送入 LangGraph 并流式打印 Coordinator 输出。
 
     使用 astream_events(version="v2") 捕获两类事件：
     - on_chat_model_stream: LLM 逐 token 输出 → 实时打印，消除卡顿
     - on_chain_end (coordinator 节点): 捕获最终 AIMessage 的 tool_calls
 
-    Returns:
-        True 如果 Coordinator 派出了新 Worker（spawn_worker / send_message）。
+    memory_context: 上一轮预取好的记忆上下文 SystemMessage，直接注入本轮消息。
     """
     from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
@@ -109,8 +108,14 @@ async def _stream_coordinator(app, messages, session_id: str) -> bool:
     has_more = False
     printing = False  # 是否正在流式打印中
 
+    # 组装消息：记忆上下文（上一轮预取）→ 用户提问
+    input_msgs = []
+    if memory_context:
+        input_msgs.append(memory_context)
+    input_msgs.append(msg)
+
     async for event in app.astream_events(
-        {"messages": [msg]}, config=config, version="v2"
+        {"messages": input_msgs}, config=config, version="v2"
     ):
         kind = event["event"]
 
@@ -257,6 +262,14 @@ def _cleanup_workers():
             print(f"[系统] 已终止后台 Worker: {task_id}")
 
 
+async def _async_input(prompt: str) -> str:
+    """在线程池中执行阻塞的 input()，保证 asyncio 事件循环在等待用户输入时仍然活跃。
+    这是保证 asyncio.create_task() 后台任务（如记忆提取）能在用户输入等待期间正常运行的关键。
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: input(prompt))
+
+
 async def main():
     from server.agent.grapy import build_agent
 
@@ -266,6 +279,12 @@ async def main():
     app = await build_agent()
     session_id = f"session_{int(time.time())}"
 
+    # 追踪后台记忆提取任务，防止被 GC 丢弃或在 finally 前未完成
+    _memory_tasks: set = set()
+
+    # 记忆预取缓存：上一轮预取完成的结果，本轮直接注入，零额外延迟
+    _memory_state: dict = {"context": None}
+
     print()
     print("=" * 60)
     print(" 交互模式 — 直接输入问题 | /clear 清空上下文 | /exit 退出")
@@ -274,7 +293,9 @@ async def main():
     try:
         while True:
             try:
-                query = input("\n你: ").strip()
+                # ⚡ 使用异步 input，让事件循环在等待用户输入期间可以继续执行后台任务（如记忆提取）
+                query = await _async_input("\n你: ")
+                query = query.strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n[系统] 退出")
                 break
@@ -290,12 +311,48 @@ async def main():
                 print("[系统] 上下文已清空")
                 continue
 
-            has_workers = await _stream_coordinator(app, query, session_id)
+            # 获取本轮对话前的消息长度，以便后台记忆提取器精确捕获增量对话消息
+            config = {"configurable": {"thread_id": session_id}}
+            try:
+                state = await app.aget_state(config)
+                last_processed_len = len(state.values.get("messages", []))
+                all_messages = state.values.get("messages", [])
+            except Exception:
+                last_processed_len = 0
+                all_messages = []
+
+            # 启动下一轮记忆预取（与 Coordinator LLM 并行执行）
+            from langchain_core.messages import HumanMessage
+            from server.memory.injection import get_memory_context_message
+            prefetch_msgs = list(all_messages) + [HumanMessage(content=query)]
+
+            async def _prefetch_and_store():
+                try:
+                    _memory_state["context"] = await get_memory_context_message(prefetch_msgs)
+                except Exception:
+                    _memory_state["context"] = None
+
+            _prefetch_task = asyncio.create_task(_prefetch_and_store())
+
+            # 用上一轮预取好的记忆上下文注入本轮（第一轮为 None，冷启动）
+            has_workers = await _stream_coordinator(app, query, session_id, memory_context=_memory_state["context"])
+            _memory_state["context"] = None  # 已消费，清空等下一轮预取结果
 
             if has_workers:
                 await _wait_for_workers(app, session_id, time.time() + 90)
+
+            # 对话轮次结束，触发后台旅行记忆自动提取与持久化
+            from server.memory.extractor import extract_travel_memories
+            task = asyncio.create_task(extract_travel_memories(app, session_id, last_processed_len))
+            _memory_tasks.add(task)
+            task.add_done_callback(_memory_tasks.discard)  # 完成后自动从集合移除，防止内存泄漏
+
     finally:
         _cleanup_workers()
+        # 等待所有仍在运行的记忆提取任务完成，避免进程退出时任务被强制取消
+        if _memory_tasks:
+            print(f"[系统] 等待 {len(_memory_tasks)} 个记忆提取任务完成...")
+            await asyncio.gather(*_memory_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

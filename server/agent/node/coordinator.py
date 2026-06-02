@@ -41,6 +41,7 @@ from langchain_core.language_models import BaseChatModel
 from core.tool_registry import physical_tool_manager
 from server.tools.task_stop_tool import task_stop_tool
 from server.tools.worker_tool import spawn_worker, send_message
+from server.memory import get_memory_system_message
 
 from utils.logger import get_logger
 
@@ -218,7 +219,16 @@ async def coordinator_node(state: AgentState) -> dict:
 
     system_msg = _get_system_message()
     llm = _get_llm_with_tools()
-    messages = [system_msg] + state.get("messages", [])
+
+    additional_system_messages = []
+
+    # 长期记忆系统指南及 MEMORY.md 索引（mtime 感知缓存，无 IO 损耗）
+    memory_system_msg = get_memory_system_message()
+    additional_system_messages.append(memory_system_msg)
+
+    # 动态记忆上下文由 main.py 预取并注入到本轮消息中，此处无需重复检索
+
+    messages = [system_msg] + additional_system_messages + state.get("messages", [])
 
     node_logger.info("Coordinator 思考中...")
 
