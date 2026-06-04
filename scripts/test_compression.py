@@ -10,8 +10,8 @@ from server.agent.session_storage import (
     record_transcript, 
     load_transcript_file,
     get_session_transcript_path,
-    MAX_CONTEXT_TOKENS
 )
+from server.agent.compression.session_compression import MAX_CONTEXT_TOKENS
 from utils.tokens import token_count_with_estimation
 
 async def main():

@@ -12,14 +12,13 @@ import os
 import json
 import time
 import asyncio
+import threading
+from typing import List, Dict, Any, Optional, Set
 from utils.logger import get_logger
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional, Set
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from utils.tokens import token_count_with_estimation, rough_estimation_for_messages
-
-MAX_CONTEXT_TOKENS = 200_000
 
 logger = get_logger("shiliu.session_storage")
 
@@ -163,6 +162,7 @@ class SessionStorageManager:
         self._written_uuids: Set[str] = set()
         self._drain_task: Optional[asyncio.Task] = None
         self._is_draining = False
+        self._file_lock = threading.Lock()
 
     def ensure_drain_task(self):
         """确保后台刷盘任务正在运行。"""
@@ -205,8 +205,9 @@ class SessionStorageManager:
             self._is_draining = False
 
     def _append_to_file(self, file_path: str, content: str):
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(content)
+        with self._file_lock:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(content)
 
     def to_transcript(self, msg: BaseMessage, session_id: str, parent_uuid: Optional[str]) -> TranscriptMessage:
         msg_type = "user"
@@ -273,6 +274,18 @@ class SessionStorageManager:
             usage=usage
         )
 
+    async def append_entry(self, entry: dict):
+        """写入任意 JSONL 记录（例如 context collapse commit）。"""
+        session_id = entry.get("session_id") or get_active_session_id()
+        if not session_id:
+            return
+            
+        file_path = get_session_transcript_path(session_id)
+        # 添加换行符
+        content = json.dumps(entry, ensure_ascii=False) + "\n"
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._append_to_file, file_path, content)
+
     def enqueue_messages(self, session_id: str, messages: List[BaseMessage]):
         """
         比对当前传入的完整消息链，只将新产生的增量消息压入写队列。
@@ -310,76 +323,6 @@ async def record_transcript(session_id: str, messages: List[BaseMessage]):
     """
     global_session_storage.enqueue_messages(session_id, messages)
 
-def trim_context(messages: List[BaseMessage]) -> List[BaseMessage]:
-    """
-    对实时对话中的 LangChain BaseMessage 列表进行上下文窗口裁剪。
-    使用混合计费策略（从后向前找最后一条带 usage_metadata 的 AIMessage 作为精确锚点，
-    锚点之后用粗略估算），超过 MAX_CONTEXT_TOKENS 时从前往后丢弃最旧的非 system 消息。
-    返回裁剪后的消息列表（若无需裁剪则返回原列表）。
-    """
-    if not messages:
-        return messages
-
-    current_tokens = token_count_with_estimation(messages)
-    if current_tokens <= MAX_CONTEXT_TOKENS:
-        return messages
-
-    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-    non_sys_msgs = [m for m in messages if not isinstance(m, SystemMessage)]
-
-    tokens_to_drop = current_tokens - MAX_CONTEXT_TOKENS
-    dropped_tokens = 0
-    dropped_count = 0
-
-    while non_sys_msgs and dropped_tokens < tokens_to_drop:
-        non_sys_msgs.pop(0)
-        dropped_count += 1
-        # 每丢弃一条消息后重新估算剩余总量，避免累积估算误差
-        remaining = system_msgs + non_sys_msgs
-        current_tokens = token_count_with_estimation(remaining)
-        if current_tokens <= MAX_CONTEXT_TOKENS:
-            break
-        # 更新仍需释放的 token 数
-        tokens_to_drop = current_tokens - MAX_CONTEXT_TOKENS
-
-    kept_uuids = {m.id for m in system_msgs + non_sys_msgs}
-    result = [m for m in messages if m.id in kept_uuids]
-
-    if dropped_count > 0:
-        logger.info(
-            "上下文窗口压缩完成",
-            original_count=len(messages),
-            dropped_count=dropped_count,
-            kept_count=len(result),
-            estimated_tokens=token_count_with_estimation(result),
-        )
-    return result
-
-
-def compress_messages(messages: List[TranscriptMessage]) -> List[TranscriptMessage]:
-    """
-    使用混合计费策略计算 Token，并在超过 MAX_CONTEXT_TOKENS (200K) 时，
-    从前往后丢弃最旧的非 system 消息，直至满足大小限制。
-    """
-    current_tokens = token_count_with_estimation(messages)
-    if current_tokens <= MAX_CONTEXT_TOKENS:
-        return messages
-
-    system_msgs = [m for m in messages if m.role == "system" or m.type == "system"]
-    non_sys_msgs = [m for m in messages if m.role != "system" and m.type != "system"]
-
-    tokens_to_drop = current_tokens - MAX_CONTEXT_TOKENS
-    dropped_tokens = 0
-
-    while non_sys_msgs and dropped_tokens < tokens_to_drop:
-        # 丢弃最旧的一条非系统消息，并累加其估算大小 (snipTokensFreed 逻辑)
-        msg = non_sys_msgs.pop(0)
-        dropped_tokens += rough_estimation_for_messages([msg])
-
-    # 保持原有的顺序
-    kept_uuids = {m.uuid for m in system_msgs + non_sys_msgs}
-    return [m for m in messages if m.uuid in kept_uuids]
-
 async def load_transcript_file(session_id: str) -> List[BaseMessage]:
     """
     从 JSONL 恢复会话记录：读取所有条目，并通过 parentUuid 重建因果链表（解决分支分叉问题）。
@@ -392,6 +335,7 @@ async def load_transcript_file(session_id: str) -> List[BaseMessage]:
     entries_map: Dict[str, TranscriptMessage] = {}
     leaf_uuid: Optional[str] = None
     latest_ts = 0.0
+    collapse_commits = []
 
     # 解析 JSONL
     try:
@@ -402,6 +346,11 @@ async def load_transcript_file(session_id: str) -> List[BaseMessage]:
                     continue
                 try:
                     entry_dict = json.loads(line)
+                    
+                    if entry_dict.get("type") == "marble-origami-commit":
+                        collapse_commits.append(entry_dict)
+                        continue
+                        
                     entry = TranscriptMessage(**entry_dict)
                     entries_map[entry.uuid] = entry
 
@@ -415,6 +364,13 @@ async def load_transcript_file(session_id: str) -> List[BaseMessage]:
     except Exception as e:
         logger.error(f"读取 {file_path} 失败: {e}")
         return []
+
+    # 加载 commit log
+    try:
+        from server.agent.compression.context_collapse import global_collapse_store
+        global_collapse_store.load_commits(collapse_commits)
+    except Exception as e:
+        logger.warning(f"加载 Collapse Commit Log 失败: {e}")
 
     if not leaf_uuid:
         return []
@@ -432,6 +388,8 @@ async def load_transcript_file(session_id: str) -> List[BaseMessage]:
             current_uuid = None
 
     ordered_uuids.reverse()
+
+    from server.agent.compression.session_compression import compress_messages
 
     # 应用上下文窗口压缩逻辑
     ordered_entries = [entries_map[uid] for uid in ordered_uuids if uid in entries_map]

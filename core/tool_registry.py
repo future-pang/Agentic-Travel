@@ -43,6 +43,7 @@ logger = get_logger("shiliu.core.tools")
 COORDINATOR_ALLOWED_TOOLS = {
     "spawn_worker",
     "send_message",
+    "read_local_file",
     "subscribe_pr_activity"  # 预留给未来的 MCP 订阅工具
 }
 

@@ -73,6 +73,16 @@ def _get_system_message() -> SystemMessage:
 - **spawn_worker** - 启动一个全新的 Worker
 - **send_message** - 继续一个现有的 Worker（向它的 `Task-ID` 发送追加指令）
 - **TaskStop** - 强制停止一个正在后台运行的特工任务（传入 task_id）
+- **SnipTool** - 压缩上下文历史：移除早期不再相关的旧消息，释放上下文空间
+
+### SnipTool 使用指南
+当你收到 `[Context Efficiency Notice]` 提示，或发现上下文中有大量早已无关的旧对话时，
+可调用 SnipTool 指定要压缩的消息 ID 范围：
+- `to_id`: 必填，压缩区域的结束消息 ID（含），使用消息末尾的 `[id:XXXXXX]` 标签值
+- `from_id`: 可选，起始 ID，不填则从最早的非系统消息开始
+
+**什么时候 snip**：用户话题已切换、Worker 的全部旧报告都已综合完毕、上下文窗口快满时。
+**不要 snip**：当前轮次的相关消息、最近 10 条消息（受系统保护，snip 无效）。
 
 调用 spawn_worker 时：
 - 不要用一个 Worker 去检查另一个 Worker。Worker 跑完会自动通知你。
@@ -201,14 +211,57 @@ You:
     return _CACHED_SYSTEM_MESSAGE
 
 
+# SnipTool 需要在运行时绑定 app 实例，单独缓存
+_CACHED_SNIP_TOOL = None
+_SNIP_APP_REF = None
+_SNIP_SESSION_GETTER = None
+
+
+def init_snip_tool(app, session_id_getter):
+    """在 main.py build_agent 后调用一次，绑定 SnipTool 所需的 app 和 session_id_getter。
+    
+    同时将 SnipTool 注册到 PersistingToolNode（通过 app._tool_node），
+    确保 LangGraph ToolNode 能在 coordinator 调用时执行它。
+    """
+    global _SNIP_APP_REF, _SNIP_SESSION_GETTER, _CACHED_SNIP_TOOL, _CACHED_LLM_WITH_TOOLS
+    _SNIP_APP_REF = app
+    _SNIP_SESSION_GETTER = session_id_getter
+
+    # 立即构建 SnipTool
+    from server.tools.snip_tool import make_snip_tool
+    _CACHED_SNIP_TOOL = make_snip_tool(app, session_id_getter)
+
+    # 将 SnipTool 注册进 PersistingToolNode 的工具列表（LangGraph 执行层）
+    tool_node = getattr(app, "_tool_node", None)
+    if tool_node is not None:
+        # ToolNode 内部以字典形式缓存工具：{tool_name: tool}
+        # 直接向 tools_by_name 追加即可
+        # 注册到 ToolNode 的查找结构中，确保工具执行时能被找到
+        if hasattr(tool_node, "tools"):
+            tool_node.tools.append(_CACHED_SNIP_TOOL)
+        if hasattr(tool_node, "tools_by_name"):
+            tool_node.tools_by_name[_CACHED_SNIP_TOOL.name] = _CACHED_SNIP_TOOL
+        logger.info("SnipTool 已注册到 ToolNode", tool_name=_CACHED_SNIP_TOOL.name)
+
+    # 重置 LLM 缓存，下次 _get_llm_with_tools() 会重建（携带 SnipTool）
+    _CACHED_LLM_WITH_TOOLS = None
+
+
 def _get_llm_with_tools() -> BaseChatModel:
-    global _CACHED_LLM_WITH_TOOLS
+    global _CACHED_LLM_WITH_TOOLS, _CACHED_SNIP_TOOL
     if _CACHED_LLM_WITH_TOOLS is not None:
         return _CACHED_LLM_WITH_TOOLS
 
-    coord_tools = physical_tool_manager.get_coordinator_tools(
-        [spawn_worker, send_message, task_stop_tool]
-    )
+    base_tools = [spawn_worker, send_message, task_stop_tool]
+
+    # 若 SnipTool 已初始化，加入工具列表
+    if _SNIP_APP_REF is not None and _SNIP_SESSION_GETTER is not None:
+        if _CACHED_SNIP_TOOL is None:
+            from server.tools.snip_tool import make_snip_tool
+            _CACHED_SNIP_TOOL = make_snip_tool(_SNIP_APP_REF, _SNIP_SESSION_GETTER)
+        base_tools = base_tools + [_CACHED_SNIP_TOOL]
+
+    coord_tools = physical_tool_manager.get_coordinator_tools(base_tools)
     _CACHED_LLM_WITH_TOOLS = get_planner_llm().bind_tools(coord_tools)
     logger.info("LLM + Tools 已缓存", tool_count=len(coord_tools))
     return _CACHED_LLM_WITH_TOOLS
@@ -230,7 +283,43 @@ async def coordinator_node(state: AgentState) -> dict:
 
     messages = [system_msg] + additional_system_messages + state.get("messages", [])
 
+    # ------------------------------------------------------------------------
+    # 上下文压缩拦截器 (Layer 4 & Layer 5)
+    # ------------------------------------------------------------------------
+    from server.agent.compression.context_collapse import apply_collapses_if_needed, global_collapse_store
+    from server.agent.compression.auto_compact import autocompact_if_needed
+
+    state_modifiers = []
+
+    async def on_before_api_call(msgs: list) -> list:
+        # Layer 4: 读时投影 (Context Collapse)
+        if global_collapse_store.enabled:
+            msgs = await apply_collapses_if_needed(msgs, global_collapse_store)
+
+        # Layer 5: 全量摘要兜底 (如果 Layer 4 没压住，或者没启用，才触发)
+        compact_result = await autocompact_if_needed(msgs)
+        if compact_result.was_compacted:
+            from langchain_core.messages import RemoveMessage
+            # 记录需要从 State 中永久删除的老消息
+            for m in msgs:
+                if m not in compact_result.messages and m.id:
+                    state_modifiers.append(RemoveMessage(id=m.id))
+            
+            # 找出新生成的消息（如 summary 占位符、restored_context）并追加
+            for m in compact_result.messages:
+                if m not in msgs:
+                    state_modifiers.append(m)
+                    
+            return compact_result.messages
+            
+        return msgs
+
+    messages_for_query = await on_before_api_call(messages)
+
     node_logger.info("Coordinator 思考中...")
 
-    response = await llm.ainvoke(messages)
+    response = await llm.ainvoke(messages_for_query)
+    
+    if state_modifiers:
+        return {"messages": state_modifiers + [response]}
     return {"messages": [response]}

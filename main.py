@@ -89,10 +89,11 @@ TOOL_LABELS = {
     "spawn_worker": "启动 Worker",
     "send_message": "继续 Worker",
     "TaskStop": "终止 Worker",
+    "SnipTool": "上下文压缩",
 }
 
 
-async def _stream_coordinator(app, messages, session_id: str, memory_context=None) -> bool:
+async def _stream_coordinator(app, messages, session_id: str, memory_context=None, all_messages=None) -> bool:
     """将消息送入 LangGraph 并流式打印 Coordinator 输出。
 
     使用 astream_events(version="v2") 捕获两类事件：
@@ -100,11 +101,26 @@ async def _stream_coordinator(app, messages, session_id: str, memory_context=Non
     - on_chain_end (coordinator 节点): 捕获最终 AIMessage 的 tool_calls
 
     memory_context: 上一轮预取好的记忆上下文 SystemMessage，直接注入本轮消息。
+    all_messages: 当前 LangGraph state 中已有的全量消息（用于 snip nudge 判断）。
     """
-    from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
+    from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, SystemMessage
+    from server.agent.compression.snip_compact import derive_short_id, should_nudge_for_snips
 
     config = {"configurable": {"thread_id": session_id}}
-    msg = HumanMessage(content=messages) if isinstance(messages, str) else messages
+
+    # 为用户消息注入 [id:XXXXXX] 短 ID 标签，让模型能通过 SnipTool 引用消息
+    if isinstance(messages, str):
+        import uuid as _uuid
+        new_id = str(_uuid.uuid4())
+        short_id = derive_short_id(new_id)
+        msg = HumanMessage(content=f"{messages} [id:{short_id}]", id=new_id)
+    else:
+        msg = messages
+        if msg.id:
+            short_id = derive_short_id(msg.id)
+            if isinstance(msg.content, str) and f"[id:{short_id}]" not in msg.content:
+                msg = HumanMessage(content=f"{msg.content} [id:{short_id}]", id=msg.id)
+
     has_more = False
     printing = False  # 是否正在流式打印中
 
@@ -112,6 +128,18 @@ async def _stream_coordinator(app, messages, session_id: str, memory_context=Non
     input_msgs = []
     if memory_context:
         input_msgs.append(memory_context)
+
+    # 上下文效率提示：若距上次 snip 积累了 >10K token，提示 Coordinator 主动压缩
+    if all_messages and should_nudge_for_snips(all_messages):
+        input_msgs.append(SystemMessage(
+            content=(
+                "[Context Efficiency Notice]\n"
+                "上下文窗口已积累较多历史消息。如果你发现早期消息已不再相关，"
+                "可以调用 SnipTool 来压缩历史上下文，释放空间。"
+                "每条用户消息末尾的 [id:XXXXXX] 标签可作为 SnipTool 的范围参数。"
+            )
+        ))
+
     input_msgs.append(msg)
 
     async for event in app.astream_events(
@@ -222,6 +250,9 @@ async def _wait_for_workers(app, session_id: str, deadline: float):
         except Exception as e:
             print(f"\n[系统] 处理 Worker 通知时出错: {e}")
 
+        # 应用 SnipTool 的状态修改
+        await _apply_pending_snips(app, session_id_from_q)
+
         # 通知处理完毕，标记该 Worker 为已完成
         if worker_id:
             task = global_task_manager.get_task(worker_id)
@@ -252,6 +283,9 @@ async def _wait_for_workers(app, session_id: str, deadline: float):
         except Exception as e:
             print(f"\n[系统] 超时总结出错: {e}")
 
+        # 应用 SnipTool 的状态修改
+        await _apply_pending_snips(app, session_id)
+
 
 def _cleanup_workers():
     """取消所有仍在运行的后台 Worker。"""
@@ -260,6 +294,47 @@ def _cleanup_workers():
         if info.status == "running":
             info.future.cancel()
             print(f"[系统] 已终止后台 Worker: {task_id}")
+
+
+async def _apply_pending_snips(app, session_id: str):
+    """检查最新一轮对话中是否有 SnipTool 调用，有则执行状态写入。
+
+    SnipTool 本身只做参数校验，不直接修改 LangGraph 状态（避免与 add_messages
+    reducer 产生竞态）。实际的 snip 由此函数在 ToolNode 返回且状态合并完成后执行。
+    通过标记 AIMessage.additional_kwargs["_snip_applied"] 防止重复处理。
+    """
+    from server.agent.compression.snip_compact import snip_by_id_range
+
+    config = {"configurable": {"thread_id": session_id}}
+    try:
+        state = await app.aget_state(config)
+        messages = state.values.get("messages", [])
+    except Exception:
+        return
+
+    for msg in reversed(messages):
+        if not hasattr(msg, "tool_calls") or not msg.tool_calls:
+            continue
+        if msg.additional_kwargs.get("_snip_applied"):
+            continue
+
+        for tc in msg.tool_calls:
+            if tc.get("name") != "SnipTool":
+                continue
+            args = tc.get("args", {})
+            to_id = args.get("to_id")
+            if not to_id:
+                continue
+
+            snip_result = snip_by_id_range(messages, to_id=to_id, from_id=args.get("from_id"))
+            if snip_result.tokens_freed > 0:
+                await app.aupdate_state(config, {"messages": snip_result.messages})
+                boundary = snip_result.boundary_message
+                removed = boundary.additional_kwargs.get("messages_removed", "?") if boundary else "?"
+                print(f"[系统] Snip 压缩：释放 {snip_result.tokens_freed:,} tokens，移除 {removed} 条旧消息")
+
+            msg.additional_kwargs["_snip_applied"] = True
+            return
 
 
 async def _async_input(prompt: str) -> str:
@@ -295,6 +370,10 @@ async def main():
     else:
         session_id = create_new_session()
         print(f"\n[系统] 已创建新会话: {session_id}")
+
+    # 初始化 SnipTool（绑定 app 实例和 session_id getter，供 Coordinator 主动 snip）
+    from server.agent.node.coordinator import init_snip_tool
+    init_snip_tool(app, lambda: session_id)
 
     # 追踪后台记忆提取任务，防止被 GC 丢弃或在 finally 前未完成
     _memory_tasks: set = set()
@@ -384,14 +463,35 @@ async def main():
                 last_processed_len = 0
                 all_messages = []
 
-            # 上下文窗口管理：裁剪超过 200K 的旧消息（保留 SystemMessage）
-            from server.agent.session_storage import trim_context
+            # Step 1: 上下文窗口管理 — trim_context（超过 200K 兜底裁剪）
+            from server.agent.compression.session_compression import trim_context
             if all_messages:
                 trimmed = trim_context(all_messages)
                 if len(trimmed) < len(all_messages):
                     await app.aupdate_state(config, {"messages": trimmed})
                     all_messages = trimmed
                     last_processed_len = len(trimmed)
+
+            # Step 2: Snip 压缩 — 自动从头部移除旧消息（超过 150K 触发）
+            from server.agent.compression.snip_compact import snip_compact_if_needed
+            if all_messages:
+                snip_result = snip_compact_if_needed(all_messages)
+                if snip_result.tokens_freed > 0:
+                    await app.aupdate_state(config, {"messages": snip_result.messages})
+                    all_messages = snip_result.messages
+                    last_processed_len = len(snip_result.messages)
+                    print(f"[系统] Snip 压缩：释放 {snip_result.tokens_freed:,} tokens，移除 {snip_result.boundary_message.additional_kwargs.get('messages_removed', '?')} 条旧消息")
+
+            # Step 3: Micro-Compact — 清理过期工具结果（会话空闲 60 分钟后触发）
+            # 时间衰减策略：Prompt Cache 已冷，清理旧工具输出，保留最近 5 个结果
+            from server.agent.compression.micro_compact import micro_compact_if_needed
+            if all_messages:
+                mc_result = micro_compact_if_needed(all_messages)
+                if mc_result.tools_cleared > 0:
+                    await app.aupdate_state(config, {"messages": mc_result.messages})
+                    all_messages = mc_result.messages
+                    last_processed_len = len(mc_result.messages)
+                    print(f"[系统] Micro-Compact：清理 {mc_result.tools_cleared} 条旧工具结果，释放 {mc_result.tokens_freed:,} tokens")
 
             # 启动下一轮记忆预取（与 Coordinator LLM 并行执行）
             from langchain_core.messages import HumanMessage
@@ -407,8 +507,15 @@ async def main():
             _prefetch_task = asyncio.create_task(_prefetch_and_store())
 
             # 用上一轮预取好的记忆上下文注入本轮（第一轮为 None，冷启动）
-            has_workers = await _stream_coordinator(app, query, session_id, memory_context=_memory_state["context"])
+            has_workers = await _stream_coordinator(
+                app, query, session_id,
+                memory_context=_memory_state["context"],
+                all_messages=all_messages,
+            )
             _memory_state["context"] = None  # 已消费，清空等下一轮预取结果
+
+            # 应用 SnipTool 的状态修改（在 ToolNode 返回后执行，避免竞态）
+            await _apply_pending_snips(app, session_id)
 
             if has_workers:
                 await _wait_for_workers(app, session_id, time.time() + 90)

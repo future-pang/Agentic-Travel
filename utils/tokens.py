@@ -57,7 +57,7 @@ def rough_estimation_for_messages(messages: List[Any]) -> int:
             
     return total
 
-def token_count_with_estimation(messages: List[Any]) -> int:
+def token_count_with_estimation(messages: List[Any], original_messages: List[Any] = None) -> int:
     """混合计费策略：从后向前找到最后一条带 usage/usage_metadata 的消息作为精确锚点，锚点之后的消息用粗略估算补齐。若无锚点则全量估算。"""
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -66,8 +66,28 @@ def token_count_with_estimation(messages: List[Any]) -> int:
         
         if usage and isinstance(usage, dict):
             exact_tokens = get_token_count_from_usage(usage)
+            
+            # 若提供了 original_messages，需要比对锚点之前的消息，扣除已被丢弃消息的估算 token 数
+            if original_messages:
+                msg_id = getattr(msg, "id", None) or getattr(msg, "uuid", None)
+                orig_idx = -1
+                for idx, orig_msg in enumerate(original_messages):
+                    orig_id = getattr(orig_msg, "id", None) or getattr(orig_msg, "uuid", None)
+                    if orig_id == msg_id:
+                        orig_idx = idx
+                        break
+                if orig_idx != -1:
+                    current_ids = {getattr(m, "id", None) or getattr(m, "uuid", None) for m in messages[:i]}
+                    missing_msgs = []
+                    for orig_msg in original_messages[:orig_idx]:
+                        orig_id = getattr(orig_msg, "id", None) or getattr(orig_msg, "uuid", None)
+                        if orig_id not in current_ids:
+                            missing_msgs.append(orig_msg)
+                    if missing_msgs:
+                        exact_tokens -= rough_estimation_for_messages(missing_msgs)
+            
             subsequent_msgs = messages[i+1:]
             estimated_tokens = rough_estimation_for_messages(subsequent_msgs)
-            return exact_tokens + estimated_tokens
+            return max(0, exact_tokens) + estimated_tokens
 
     return rough_estimation_for_messages(messages)
