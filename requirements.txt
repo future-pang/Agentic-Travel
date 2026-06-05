@@ -1,4 +1,3 @@
-
 fastapi
 uvicorn[standard]
 pydantic>=2.0.0
@@ -10,6 +9,7 @@ langchain>=0.3.0
 langchain-core
 langchain-community
 langchain-openai
+langchain-deepseek
 langgraph
 llama-parse
 langchain-text-splitters
@@ -20,3 +20,11 @@ redis
 chromadb
 tenacity
 httpx
+aiosqlite
+llama-index-core
+llama-index-embeddings-openai
+llama-index-vector-stores-chroma
+llama-index-retrievers-bm25
+pyyaml
+openai
+pytest
