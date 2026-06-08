@@ -16,19 +16,13 @@ from utils.logger import get_logger
 
 logger = get_logger("shiliu.context_collapse")
 
-# ============================================================================
-# 阈值配置
-# ============================================================================
 EFFECTIVE_WINDOW = 180_000     # 200K - 20K (预留给输出)
 COMMIT_THRESHOLD = 162_000     # 90%
 AUTOCOMPACT_THRESHOLD = 167_000 # 93%
 BLOCKING_THRESHOLD = 171_000   # 95%
 
-KEEP_RECENT = 15  # 保护最近 15 条消息不被 Collapse
+KEEP_RECENT = 15
 
-# ============================================================================
-# 核心数据结构
-# ============================================================================
 @dataclass
 class CollapseCommit:
     collapse_id: str
@@ -70,13 +64,8 @@ class CollapseStore:
             )
             self.add_commit(c)
 
-# 全局单例
 global_collapse_store = CollapseStore()
 
-
-# ============================================================================
-# 核心业务逻辑
-# ============================================================================
 
 async def apply_collapses_if_needed(messages: List[BaseMessage], store: CollapseStore = global_collapse_store) -> List[BaseMessage]:
     """
@@ -113,17 +102,14 @@ def _stage_spans(messages: List[BaseMessage], store: CollapseStore):
     """
     protected_start = max(0, len(messages) - KEEP_RECENT)
     candidates = messages[:protected_start]
-    
-    # 过滤掉系统消息，并找出已经被 commit 覆盖的消息 ID 集合
+
     committed_ids = _get_all_committed_ids(messages, store)
     
     current_span = []
     
     def try_stage_current_span():
         if len(current_span) >= 5:  # 至少积累 5 条才作为一个 span
-            # 检查这个 span 的第一条和最后一条是否已有 id
             if current_span[0].id and current_span[-1].id:
-                # 检查是否已经存在于 store.staged 中
                 existing = any(s.start_uuid == current_span[0].id for s in store.staged)
                 if not existing:
                     store.staged.append(StagedSpan(
@@ -142,18 +128,15 @@ def _stage_spans(messages: List[BaseMessage], store: CollapseStore):
 
     for msg in candidates:
         if isinstance(msg, SystemMessage):
-            # 遇到系统消息断开 span
             try_stage_current_span()
             continue
             
         if msg.id and msg.id in committed_ids:
-            # 已经 commit 的消息跳过，并断开当前 span
             try_stage_current_span()
             continue
             
         current_span.append(msg)
-        
-    # 处理末尾遗留的 span
+
     try_stage_current_span()
 
 
@@ -167,15 +150,12 @@ async def _commit_staged(messages: List[BaseMessage], store: CollapseStore, limi
     to_commit = store.staged[:limit] if limit else store.staged
     
     for span in to_commit:
-        # 提取消息实体
         span_msgs = _extract_messages_by_range(messages, span.start_uuid, span.end_uuid)
         if not span_msgs:
             continue
-            
-        # 调用大模型生成摘要
+
         summary = await _generate_span_summary(span_msgs)
-        
-        # 构建 Commit 对象
+
         commit = CollapseCommit(
             collapse_id=uuid.uuid4().hex[:16],
             summary_uuid=str(uuid.uuid4()),
@@ -183,11 +163,9 @@ async def _commit_staged(messages: List[BaseMessage], store: CollapseStore, limi
             first_msg_uuid=span.start_uuid,
             last_msg_uuid=span.end_uuid
         )
-        
-        # 加入内存状态
+
         store.add_commit(commit)
-        
-        # 通知持久化层 (session_storage.py) 将 commit 记录写入 JSONL
+
         await _persist_collapse_commit(commit)
         
         logger.info(
@@ -195,21 +173,24 @@ async def _commit_staged(messages: List[BaseMessage], store: CollapseStore, limi
             collapse_id=commit.collapse_id,
             msg_count=len(span_msgs)
         )
-        
-    # 从队列中移除已处理的
+
     store.staged = store.staged[len(to_commit):]
 
 
 def _project_view(messages: List[BaseMessage], store: CollapseStore) -> List[BaseMessage]:
-    """
-    读时投影。
-    对 messages 进行物理替换：遇到属于某个 commit 范围的消息，丢弃之，只保留一个 SystemMessage 占位符。
-    返回新的消息列表给大模型使用（不改变传入的 messages 引用）。
+    """ 根据当前的 commits 信息，将 messages 中被折叠的部分替换为 <collapsed> 标签。
+
+    Args:
+        messages: 当前上下文消息列表（原始视图）
+        store: CollapseStore 实例，包含当前的 commits 和 staged 信息
+
+    Returns:
+        List[BaseMessage]: 投影后的消息列表，其中被 commits 包裹的消息被替换为 <collapsed> 标签的 SystemMessage。
+
     """
     if not store.commits:
         return messages
-        
-    # 构建快速查找边界的索引
+
     commit_boundaries = {}
     for c in store.commits:
         commit_boundaries[c.first_msg_uuid] = c
@@ -225,28 +206,28 @@ def _project_view(messages: List[BaseMessage], store: CollapseStore) -> List[Bas
             # 如果它是这个折叠块的开头，我们在此处插入占位符
             c = commit_boundaries.get(msg.id)
             if c and c.first_msg_uuid == msg.id:
-                # 插入摘要
                 summary_msg = SystemMessage(
                     content=f'<collapsed id="{c.collapse_id}">\n{c.summary_content}\n</collapsed>',
                     id=c.summary_uuid,
                     additional_kwargs={"is_collapsed_summary": True}
                 )
                 projected.append(summary_msg)
-            # 否则丢弃原始消息
             continue
-            
-        # 未折叠的消息，原样保留
+
         projected.append(msg)
         
     return projected
 
-
-# ============================================================================
-# 辅助函数
-# ============================================================================
-
 async def _generate_span_summary(span_messages: List[BaseMessage]) -> str:
-    """调用大模型生成摘要"""
+    """ 使用 LLM 生成 span 的摘要文本。摘要应该极简地总结 span_messages 中的核心信息，包括关键事实、结论、文件路径或实体状态等，确保不遗漏任何影响后续任务的内容。
+
+    Args:
+        span_messages: 需要生成摘要的消息列表，通常包含连续的一段对话和工具调用记录。这些消息已经被确定为一个待折叠的区段。
+
+    Returns:
+        str: 生成的摘要文本，应该极简地总结 span_messages 中的核心信息，包括关键事实、结论、文件路径或实体状态等，确保不遗漏任何影响后续任务的内容。
+
+    """
     from server.agent.llm_factory import get_planner_llm
     llm = get_planner_llm()
     
@@ -266,7 +247,16 @@ async def _generate_span_summary(span_messages: List[BaseMessage]) -> str:
 
 
 def _get_all_committed_ids(messages: List[BaseMessage], store: CollapseStore) -> Set[str]:
-    """返回所有被 commits 包裹的消息 ID 集合"""
+    """ 扫描当前 messages，结合 store 中的 commits 信息，找出所有被折叠掉的消息 ID。
+
+    Args:
+        messages: 当前上下文消息列表（原始视图）
+        store: CollapseStore 实例，包含当前的 commits 和 staged 信息
+
+    Returns:
+        Set[str]: 当前 messages 中所有被 commits 包裹的消息 ID 集合。这些消息应该在投影视图中被替换为 <collapsed> 标签。
+
+    """
     committed_ids = set()
     for c in store.commits:
         in_range = False

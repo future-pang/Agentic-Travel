@@ -1,4 +1,3 @@
-# python
 import os
 import json
 from typing import Any, Dict
@@ -19,17 +18,13 @@ class PersistingToolNode(ToolNode):
     """
 
     async def ainvoke(self, input: Any, config: Dict[str, Any], **kwargs: Any) -> Any:
-        # 调用父类的 ainvoke 来运行原始 ToolNode
         result = await super().ainvoke(input, config, **kwargs)
-
-        # 'result' 应为包含 "messages" 列表的字典
         if not isinstance(result, dict) or "messages" not in result:
             return result
 
         messages = result["messages"]
         session_id = config.get("configurable", {}).get("thread_id", "default_session")
 
-        # 确定保存路径
         history_dir = os.path.join(".data", "chat_history", session_id, "tool-results")
         os.makedirs(history_dir, exist_ok=True)
 
@@ -55,7 +50,6 @@ class PersistingToolNode(ToolNode):
             content_str = extract_text(msg.content)
             original_size = len(content_str)
 
-            # 检查是否超过阈值
             if original_size > DEFAULT_MAX_RESULT_SIZE_CHARS:
                 tool_call_id = msg.tool_call_id
 
@@ -64,7 +58,6 @@ class PersistingToolNode(ToolNode):
                 file_path = os.path.join(history_dir, file_name)
 
                 try:
-                    # Write original content to disk
                     with open(file_path, "w", encoding="utf-8") as f:
                         f.write(content_str)
                 except Exception as e:
@@ -72,10 +65,8 @@ class PersistingToolNode(ToolNode):
                     processed_messages.append(msg)
                     continue
 
-                # 取前 2KB 作为预览
                 preview = content_str[:2048]
 
-                # 用 JSON 元数据替换原始内容
                 replacement_dict = {
                     "persisted_output": True,
                     "original_size_bytes": len(content_str.encode("utf-8")),
@@ -87,6 +78,5 @@ class PersistingToolNode(ToolNode):
 
             processed_messages.append(msg)
 
-        # 将处理后的消息放回 result 字典
         result["messages"] = processed_messages
         return result

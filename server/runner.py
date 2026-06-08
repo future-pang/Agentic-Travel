@@ -80,7 +80,7 @@ async def coordinator_listen_loop(app):
 # ================== 测试入口 ==================
 async def main():
     # 1. 编译构建你的图
-    app = await build_agent()
+    app, conn = await build_agent()
 
     # 2. 在后台挂起【消息队列监听引擎】
     asyncio.create_task(coordinator_listen_loop(app))
@@ -94,11 +94,14 @@ async def main():
     config = {"configurable": {"thread_id": test_session}}
     msg = HumanMessage(content=user_input)
 
-    # 触发第一轮对话，Coordinator 会瞬间返回 "我已经派人去查了"
-    await app.ainvoke({"messages": [msg]}, config=config)
+    try:
+        # 触发第一轮对话，Coordinator 会瞬间返回 "我已经派人去查了"
+        await app.ainvoke({"messages": [msg]}, config=config)
 
-    # 保持主线程存活，以便观察后台 Worker 的运行和消息队列的回调
-    await asyncio.sleep(60)
+        # 保持主线程存活，以便观察后台 Worker 的运行和消息队列的回调
+        await asyncio.sleep(60)
+    finally:
+        await conn.close()
 
 
 if __name__ == "__main__":

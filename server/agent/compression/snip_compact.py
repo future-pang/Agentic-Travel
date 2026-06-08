@@ -27,7 +27,6 @@ from utils.logger import get_logger
 
 logger = get_logger("shiliu.snip_compact")
 
-# ── 常量 ───────────────────────────────────────────────────────────────────────
 
 # Snip 触发阈值：超过该值才考虑执行 snip（单位：token）
 # 设为 MAX_CONTEXT_TOKENS 的 75%，给 LLM 留出足够的响应空间
@@ -46,9 +45,6 @@ NUDGE_INTERVAL_TOKENS = 10_000
 _SNIP_MARKER_KEY = "snip_marker"
 _SNIP_BOUNDARY_KEY = "snip_boundary"
 
-
-# ── 短 ID 工具 ─────────────────────────────────────────────────────────────────
-
 def derive_short_id(msg_id: str) -> str:
     """
     从消息 UUID 推导 6 位 base36 短 ID。
@@ -62,7 +58,6 @@ def derive_short_id(msg_id: str) -> str:
     hex_str = msg_id.replace("-", "")[:10]
     try:
         num = int(hex_str, 16)
-        # Python int.to_bytes → base36 转换
         chars = "0123456789abcdefghijklmnopqrstuvwxyz"
         result = ""
         if num == 0:
@@ -80,9 +75,6 @@ def get_short_id(msg: BaseMessage) -> str:
     if msg.id:
         return derive_short_id(msg.id)
     return ""
-
-
-# ── 消息类型判断 ───────────────────────────────────────────────────────────────
 
 def is_snip_marker_message(msg: BaseMessage) -> bool:
     """判断是否为 snip 占位桩（已被砍掉消息的替身）。"""
@@ -132,8 +124,6 @@ def _make_snip_boundary(
         }
     )
 
-
-# ── 主入口 ─────────────────────────────────────────────────────────────────────
 
 class SnipCompactResult:
     """snip_compact_if_needed 的返回值。"""
@@ -223,7 +213,6 @@ def snip_by_id_range(
             logger.warning("SnipTool: 未找到 from_id 对应消息", from_id=from_id)
             return SnipCompactResult(messages)
     else:
-        # 找第一条非 system 非 snip_marker 消息
         from_idx = None
         for i, m in enumerate(messages):
             if not isinstance(m, SystemMessage) and not is_snip_marker_message(m):
@@ -236,30 +225,25 @@ def snip_by_id_range(
         logger.warning("SnipTool: from_id 在 to_id 之后，跳过", from_idx=from_idx, to_idx=to_idx)
         return SnipCompactResult(messages)
 
-    # 保护最近 KEEP_RECENT 条
     protected_start = max(0, len(messages) - KEEP_RECENT)
     if from_idx >= protected_start:
         logger.warning("SnipTool: 目标范围在受保护区域内，跳过")
         return SnipCompactResult(messages)
 
-    # 实际截止位置：不进入受保护区
     actual_to_idx = min(to_idx, protected_start - 1)
 
     to_snip = messages[from_idx: actual_to_idx + 1]
     tokens_freed = rough_estimation_for_messages(to_snip)
     messages_removed = len(to_snip)
 
-    # 构建新消息列表
     now = time.time()
     boundary_msg = _make_snip_boundary(tokens_freed, messages_removed, now)
 
     new_msgs = []
-    # system 消息放最前，保持原有位置
     for i, m in enumerate(messages):
         if i < from_idx or i > actual_to_idx:
             new_msgs.append(m)
         elif i == from_idx:
-            # 在第一个被砍消息的位置插入边界标记
             new_msgs.append(boundary_msg)
             new_msgs.append(_make_snip_marker(m))
         else:
@@ -284,7 +268,6 @@ def should_nudge_for_snips(messages: List[BaseMessage]) -> bool:
     条件：距离上一次 snip（boundary 消息）之后又积累了 NUDGE_INTERVAL_TOKENS 的新内容。
     若从未 snip 过，则在总量超过 SNIP_THRESHOLD * 0.5 时开始提示。
     """
-    # 找最后一条 boundary 消息
     last_boundary_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         if is_snip_boundary_message(messages[i]):
@@ -292,14 +275,11 @@ def should_nudge_for_snips(messages: List[BaseMessage]) -> bool:
             break
 
     if last_boundary_idx == -1:
-        # 从未 snip 过：总量超过半程就提示
         return token_count_with_estimation(messages) > SNIP_THRESHOLD * 0.5
 
     msgs_since_snip = messages[last_boundary_idx + 1:]
     return rough_estimation_for_messages(msgs_since_snip) > NUDGE_INTERVAL_TOKENS
 
-
-# ── 内部实现 ───────────────────────────────────────────────────────────────────
 
 def _do_snip(
     messages: List[BaseMessage],
@@ -310,12 +290,11 @@ def _do_snip(
 
     返回 (新消息列表, 释放的 token 数, boundary_message)
     """
-    # 将消息分为：受保护（末尾 KEEP_RECENT 条）和可 snip 区域
     protected_start = max(0, len(messages) - KEEP_RECENT)
     candidates = messages[:protected_start]
     protected = messages[protected_start:]
 
-    # 跳过最前面的 SystemMessage（它们是 system prompt，不能被 snip）
+    # 跳过最前面的 SystemMessage
     system_prefix: List[BaseMessage] = []
     non_sys_start = 0
     for i, m in enumerate(candidates):
@@ -330,7 +309,6 @@ def _do_snip(
     if not snippable:
         return messages, 0, None
 
-    # 从头开始砍，每次砍掉一整个 user+assistant 对（或单条），直到释放够 SNIP_TARGET_FREE
     snipped: List[BaseMessage] = []
     tokens_freed = 0
 

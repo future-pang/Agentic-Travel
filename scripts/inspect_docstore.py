@@ -11,6 +11,13 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
+# Reconfigure stdout to support UTF-8 on Windows terminal
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except AttributeError:
+        pass
+
 DOCSTORE_PATH = Path(__file__).resolve().parent.parent / ".data" / "docstore" / "docstore.json"
 
 # ── 终端颜色 ───────────────────────────────────────────

@@ -47,43 +47,19 @@ async def main():
     )
     print("  已成功预置：traveler_persona.md、traveler_preference.md 两项测试记忆。")
 
-    # 2. 构造游客问题 (触发 BM25 匹配)
+    # 2. 构造游客问题 (触发记忆匹配)
     user_query = "我们带老人家怎么在峨眉山游览合适？奶奶想看风景和猴子，有什么好玩的路线？"
     messages_history = [HumanMessage(content=user_query)]
-    
-    # 模拟 LangGraph AgentState
-    state = {
-        "messages": messages_history,
-        "session_id": "test_session_injection",
-        "user_query": user_query,
-        "enable_web_search": False
-    }
     print(f"\n2. 模拟游客提问: '{user_query}'")
 
-    # 3. Mock 协调员的 LLM 调用，拦截拼装后的消息参数进行断言
-    captured_messages = []
-    
-    async def mock_ainvoke(messages_list, **kwargs):
-        nonlocal captured_messages
-        captured_messages = messages_list
-        return AIMessage(content="[Mocked Response]")
-
-    # 用 Mock 拦截 _get_llm_with_tools
-    mock_llm = MagicMock()
-    mock_llm.ainvoke = mock_ainvoke
-    
-    print("\n3. 开始拦截 coordinator_node LLM 消息拼装...")
-    with patch("server.agent.node.coordinator._get_llm_with_tools", return_value=mock_llm):
-        await coordinator_node(state)
+    # 3. 直接调用 get_memory_context_message 获得记忆注入消息
+    print("\n3. 开始调用 get_memory_context_message...")
+    from server.memory.injection import get_memory_context_message
+    memory_msg = await get_memory_context_message(messages_history)
 
     # 4. 验证注入的消息结构和 JSON 格式内容
     print("\n4. 验证注入的消息体结构与 JSON 内容:")
-    print(f"  拼装后的总消息项数: {len(captured_messages)}")
-    
-    # captured_messages 应该是：[system_msg, memory_system_msg, memory_context_msg, user_msg]
-    assert len(captured_messages) == 4, "消息拼装结构错误！"
-    
-    memory_msg = captured_messages[2]
+    assert memory_msg is not None, "记忆消息不应为空！"
     assert isinstance(memory_msg, SystemMessage), "注入的记忆消息必须是 SystemMessage！"
     
     msg_content = memory_msg.content

@@ -3,6 +3,7 @@
 """
 import os
 import sys
+import time
 
 # 将项目根目录加进 python 路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -110,32 +111,33 @@ def main():
     assert "type: realtime_ctx" in topic_detail
     assert "当前位置：雷洞坪车站" in topic_detail
 
-    # 4.5 验证轻量级 BM25 关键词相关性检索 (find_relevant_memories)
-    print("\n4.5 验证轻量级 BM25 旅程记忆关键词搜索...")
-    
-    # 测试 Query 1：涉及老人体力、寒冷与痛感
-    query1 = "老人走累了，而且好冷，脚痛"
-    print(f"\n  [检索测试 1] 查询词: '{query1}'")
-    results1 = manager.find_relevant_memories(query1, limit=2)
-    for res in results1:
-        print(f"    - 匹配记忆: {res['filename']} | 分数: {res['score']} | 分类: [{res['type']}] | 描述: {res['description']}")
-    
-    # 断言首位应该是反馈文件 stamina_feedback.md (因为富含"老人"、"累"、"冷"、"痛"的字频)
-    assert len(results1) > 0
-    assert results1[0]['filename'] == "stamina_feedback.md"
+    # 4.5 验证轻量头部扫描 (scan_memory_headers) 与陈旧度检测 (check_stale_memories)
+    print("\n4.5 验证轻量头部扫描与陈旧度检测...")
+    headers = manager.scan_memory_headers()
+    print(f"  已扫描到 {len(headers)} 条记忆头部。")
+    assert len(headers) == 4
+    filenames = [h["filename"] for h in headers]
+    assert "trip_status.md" in filenames
+    assert "stamina_feedback.md" in filenames
+    assert "travel_preference.md" in filenames
+    assert "traveler_persona.md" in filenames
 
-    # 测试 Query 2：涉及即时地点（雷洞坪）、大雾和住宿
-    query2 = "雷洞坪大雾下雨，今晚住哪里？"
-    print(f"\n  [检索测试 2] 查询词: '{query2}'")
-    results2 = manager.find_relevant_memories(query2, limit=2)
-    for res in results2:
-        print(f"    - 匹配记忆: {res['filename']} | 分数: {res['score']} | 分类: [{res['type']}] | 描述: {res['description']}")
-        
-    # 断言首位应该是状态文件 trip_status.md (因为包含"雷洞坪"、"大雾"、"住宿")
-    assert len(results2) > 0
-    assert results2[0]['filename'] == "trip_status.md"
+    # 检查其中一个属性
+    h_trip = next(h for h in headers if h["filename"] == "trip_status.md")
+    assert h_trip["type"] == "realtime_ctx"
+    assert "雷洞坪" in h_trip["preview"]
 
-    print("\n  [BM25 验证通过] 双字切片与 TF-IDF 动态打分机制完美匹配了相关的旅程上下文！")
+    # 4.6 验证陈旧度检测
+    print("\n4.6 验证陈旧度检测...")
+    persona_path = os.path.join(test_memory_dir, "traveler_persona.md")
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(persona_path, (eight_days_ago, eight_days_ago))
+    
+    stale_memories = manager.check_stale_memories(days=7)
+    print(f"  检测到陈旧记忆数: {len(stale_memories)}")
+    assert len(stale_memories) == 1
+    assert stale_memories[0]["filename"] == "traveler_persona.md"
+    assert stale_memories[0]["age_days"] == 8
 
     # 5. 清理测试文件
     print("\n5. 清理测试文件...")

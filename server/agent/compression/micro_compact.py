@@ -42,7 +42,6 @@ from utils.logger import get_logger
 
 logger = get_logger("shiliu.micro_compact")
 
-# ── 常量 ──────────────────────────────────────────────────────────────────────
 
 # 时间阈值：距上一条 AI 消息超过此分钟数，认为 Prompt Cache 已失效
 GAP_THRESHOLD_MINUTES = 60
@@ -53,7 +52,7 @@ KEEP_RECENT = 5
 # 裁剪后替换的占位字符串（与 Claude Code 保持一致）
 MC_CLEARED_PLACEHOLDER = "[Old tool result content cleared]"
 
-# ── 可裁剪工具名单（可动态注册）────────────────────────────────────────────────
+# ── 可裁剪工具名单（可动态注册）
 
 # 核心规则：「可重新获取」的工具结果才能被裁剪。
 # 不可裁剪的：spawn_worker, send_message（Worker 推理不可重复）
@@ -94,9 +93,6 @@ def unregister_compactable_tool(tool_name: str) -> None:
     """将一个工具从可裁剪名单中移除（防止误清重要工具）。"""
     COMPACTABLE_TOOLS.discard(tool_name)
 
-
-# ── 核心逻辑 ──────────────────────────────────────────────────────────────────
-
 class MicroCompactResult:
     """micro_compact_if_needed 的返回值。"""
     def __init__(
@@ -136,7 +132,6 @@ def micro_compact_if_needed(
         if gap_minutes is None or gap_minutes < gap_threshold_minutes:
             return MicroCompactResult(messages)
 
-    # 收集所有可裁剪的 ToolMessage 的 tool_call_id（按顺序排列）
     compactable_ids = _collect_compactable_tool_ids(messages)
 
     if not compactable_ids:
@@ -149,7 +144,6 @@ def micro_compact_if_needed(
     if not clear_set:
         return MicroCompactResult(messages)
 
-    # 执行替换
     new_messages, tokens_freed, tools_cleared = _apply_micro_compact(messages, clear_set)
 
     if tools_cleared > 0:
@@ -164,9 +158,6 @@ def micro_compact_if_needed(
         )
 
     return MicroCompactResult(new_messages, tokens_freed, tools_cleared)
-
-
-# ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def _get_gap_since_last_ai_message(messages: List[BaseMessage]) -> Optional[float]:
     """
@@ -183,12 +174,10 @@ def _get_gap_since_last_ai_message(messages: List[BaseMessage]) -> Optional[floa
         if not isinstance(msg, AIMessage):
             continue
 
-        # 优先从 additional_kwargs 中取 created_at（我们在 to_transcript 时有写入）
         ts = None
         meta = getattr(msg, "additional_kwargs", {}) or {}
         ts = meta.get("created_at") or meta.get("timestamp")
 
-        # 也可以从 response_metadata 中取
         if ts is None:
             response_meta = getattr(msg, "response_metadata", {}) or {}
             ts = response_meta.get("created_at") or response_meta.get("timestamp")
@@ -200,7 +189,6 @@ def _get_gap_since_last_ai_message(messages: List[BaseMessage]) -> Optional[floa
             except (ValueError, TypeError):
                 pass
 
-    # 若完全没有时间戳信息，返回 None（不触发时间条件）
     return None
 
 
@@ -217,11 +205,9 @@ def _collect_compactable_tool_ids(messages: List[BaseMessage]) -> List[str]:
         if not isinstance(msg, ToolMessage):
             continue
 
-        # 已经被清理过的跳过，避免重复处理
         if isinstance(msg.content, str) and msg.content == MC_CLEARED_PLACEHOLDER:
             continue
 
-        # ToolMessage.name 字段存放工具名（LangGraph ToolNode 会自动填充）
         tool_name = getattr(msg, "name", None) or ""
 
         if tool_name in COMPACTABLE_TOOLS:
@@ -252,14 +238,12 @@ def _apply_micro_compact(
             new_messages.append(msg)
             continue
 
-        # 计算被清理的 token 数（清理前估算）
         original_tokens = rough_estimation_for_messages([msg])
         placeholder_tokens = len(MC_CLEARED_PLACEHOLDER) // 4  # 约 8 tokens
 
         tokens_freed += max(0, original_tokens - placeholder_tokens)
         tools_cleared += 1
 
-        # 创建内容已替换的新 ToolMessage（不改变 tool_call_id 和 id，保持消息链完整）
         cleared_msg = ToolMessage(
             content=MC_CLEARED_PLACEHOLDER,
             tool_call_id=msg.tool_call_id,
