@@ -75,7 +75,7 @@ Agentic_RAG/
 
 1. **克隆项目**
    ```bash
-   git clone https://github.com/future-pang/Agentic-Travel.git
+   git clone https://github.com/liunor/Agentic-Travel.git
    cd Agentic-Travel
    ```
 
